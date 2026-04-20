@@ -1,10 +1,11 @@
 """
 pdf_tool.py — Multi-function PDF utility
-Requires: pypdf, reportlab
+Requires: pypdf, reportlab, pikepdf, pillow
 
-  pip install pypdf reportlab
+  pip install pypdf reportlab pikepdf pillow
 """
 
+import io
 import os
 import sys
 from pypdf import PdfReader, PdfWriter
@@ -80,24 +81,37 @@ def merge_pdfs(files, out, password=None):
     print(f"[OK] Merged {len(files)} file(s), {total} pages → '{out}'")
 
 
+def _fmt_bytes(n):
+    for unit in ("B", "KB", "MB", "GB"):
+        if abs(n) < 1024:
+            return f"{n:,.1f} {unit}"
+        n /= 1024
+    return f"{n:,.1f} GB"
+
+
 def optimize_pdf(file_in, file_out, password=None):
-    """Reduce PDF size by compressing content streams."""
-    reader = _open_reader(file_in, password)
-    writer = PdfWriter()
+    """Reduce PDF size by compressing content streams and deduplicating objects."""
+    size_in = os.path.getsize(file_in)
+    reader  = _open_reader(file_in, password)
+    writer  = PdfWriter()
     for page in reader.pages:
         writer.add_page(page)
     for page in writer.pages:
         page.compress_content_streams()
+    try:
+        writer.compress_identical_objects(remove_duplicates=True, remove_unreferenced=True)
+    except TypeError:
+        writer.compress_identical_objects(remove_identicals=True, remove_orphans=True)
     _save(writer, file_out)
 
-    size_in  = os.path.getsize(file_in)
-    size_out = os.path.getsize(file_out)
-    saved    = size_in - size_out
-    pct      = (saved / size_in * 100) if size_in else 0
+    size_out    = os.path.getsize(file_out)
+    total_saved = size_in - size_out
+    pct         = (total_saved / size_in * 100) if size_in else 0
+
     print(f"[OK] Optimized '{file_in}' → '{file_out}'")
-    print(f"     Before : {size_in:>12,} bytes")
-    print(f"     After  : {size_out:>12,} bytes")
-    print(f"     Saved  : {saved:>12,} bytes ({pct:.1f}%)")
+    print(f"     Before : {_fmt_bytes(size_in):>12}")
+    print(f"     After  : {_fmt_bytes(size_out):>12}")
+    print(f"     Saved  : {_fmt_bytes(total_saved):>12}  ({pct:.1f}%)")
 
 
 def cut_pdf(file_in, page_str, file_out, password=None):
@@ -310,13 +324,105 @@ def edit_metadata(file_in, file_out, password=None, **kwargs):
         print(f"     {k[1:]:<10} {v}")
 
 
+def compress_images(file_in, file_out, quality=75, max_dpi=150, password=None):
+    """
+    Recompress embedded images as JPEG with optional downsampling.
+
+    quality  : JPEG quality 1-95 (default 75).
+    max_dpi  : Images whose estimated DPI exceeds this value are downsampled
+               before recompression (default 150).
+               Use 0 to skip downsampling and only recompress.
+    """
+    try:
+        import pikepdf
+        from pikepdf import PdfImage
+    except ImportError:
+        print("[ERROR] pikepdf is required: pip install pikepdf")
+        sys.exit(1)
+
+    try:
+        from PIL import Image
+    except ImportError:
+        print("[ERROR] Pillow is required: pip install pillow")
+        sys.exit(1)
+
+    open_kwargs = {"password": password} if password else {}
+    try:
+        pdf = pikepdf.open(file_in, **open_kwargs)
+    except Exception as e:
+        print(f"[ERROR] Could not open '{file_in}': {e}")
+        sys.exit(1)
+
+    total_imgs  = 0
+    downsampled = 0
+
+    with pdf:
+        for page_num, page in enumerate(pdf.pages, 1):
+            for name, img_obj in page.images.items():
+                try:
+                    pil = PdfImage(img_obj).as_pil_image()
+                except Exception as e:
+                    print(f"  [SKIP] page {page_num} {name}: {e}")
+                    continue
+
+                orig_w, orig_h = pil.size
+                total_imgs += 1
+
+                # Estimate DPI relative to the page dimensions
+                if max_dpi > 0:
+                    page_w_in = float(page.mediabox[2]) / 72
+                    page_h_in = float(page.mediabox[3]) / 72
+                    est_dpi   = max(orig_w / max(page_w_in, 0.01),
+                                   orig_h / max(page_h_in, 0.01))
+                    if est_dpi > max_dpi:
+                        scale  = max_dpi / est_dpi
+                        new_w  = max(1, int(orig_w * scale))
+                        new_h  = max(1, int(orig_h * scale))
+                        pil    = pil.resize((new_w, new_h), Image.LANCZOS)
+                        downsampled += 1
+                        print(f"  page {page_num} {name}: "
+                              f"{orig_w}x{orig_h} → {new_w}x{new_h} "
+                              f"(~{est_dpi:.0f} → {max_dpi} DPI)")
+                    else:
+                        print(f"  page {page_num} {name}: "
+                              f"{orig_w}x{orig_h}, ~{est_dpi:.0f} DPI — recompressing only")
+                else:
+                    print(f"  page {page_num} {name}: {orig_w}x{orig_h} — recompressing only")
+
+                # Re-encode as JPEG and replace stream in-place
+                buf = io.BytesIO()
+                pil.convert("RGB").save(buf, format="JPEG", quality=quality, optimize=True)
+
+                img_obj.write(buf.getvalue(), filter=pikepdf.Name("/DCTDecode"))
+                img_obj.stream_dict["/Width"]             = pil.width
+                img_obj.stream_dict["/Height"]            = pil.height
+                img_obj.stream_dict["/ColorSpace"]        = pikepdf.Name("/DeviceRGB")
+                img_obj.stream_dict["/BitsPerComponent"]  = 8
+
+        pdf.save(file_out)
+
+    size_in  = os.path.getsize(file_in)
+    size_out = os.path.getsize(file_out)
+    saved    = size_in - size_out
+    pct      = (saved / size_in * 100) if size_in else 0
+
+    print(f"[OK] Compressed images in '{file_in}' → '{file_out}'")
+    print(f"     Images found  : {total_imgs}")
+    print(f"     Downsampled   : {downsampled}")
+    print(f"     Quality       : {quality}")
+    print(f"     Max DPI       : {max_dpi if max_dpi > 0 else 'off'}")
+    print(f"     Before : {_fmt_bytes(size_in):>12}")
+    print(f"     After  : {_fmt_bytes(size_out):>12}")
+    print(f"     Saved  : {_fmt_bytes(saved):>12}  ({pct:.1f}%)")
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
 USAGE = """
 pdf_tool.py — PDF utility belt
-Requires: pip install pypdf reportlab
+Requires: pip install pypdf reportlab pikepdf pillow
 
 COMMANDS
 ────────────────────────────────────────────────────────────────────────
@@ -330,6 +436,7 @@ COMMANDS
   decrypt    input.pdf output.pdf <password>
   number     input.pdf output.pdf [--pos bottom-center] [--start 1]
              [--font-size 10] [--margin 20] [--prefix ""] [--suffix ""]
+  compress-images  input.pdf output.pdf [--quality 75] [--max-dpi 150]
   metadata   input.pdf output.pdf [--title X] [--author X]
              [--subject X] [--creator X] [--keywords X]
 
@@ -478,6 +585,21 @@ def main():
             title=title, author=author, subject=subject,
             creator=creator, producer=producer, keywords=keywords,
         )
+
+    # ── compress-images ─────────────────────────────────────────────────────
+    elif command == "compress-images":
+        if len(args) < 2:
+            print("[ERROR] compress-images: input.pdf output.pdf [--quality 75] [--max-dpi 150]")
+            sys.exit(1)
+        quality_str, args = _arg(args, "--quality", "75")
+        max_dpi_str, args = _arg(args, "--max-dpi", "150")
+        try:
+            quality = int(quality_str)
+            max_dpi = int(max_dpi_str)
+        except ValueError:
+            print("[ERROR] --quality and --max-dpi must be integers")
+            sys.exit(1)
+        compress_images(args[0], args[1], quality, max_dpi, password)
 
     else:
         print(f"[ERROR] Unknown command '{command}'")
